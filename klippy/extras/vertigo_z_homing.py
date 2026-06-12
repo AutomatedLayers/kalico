@@ -204,6 +204,12 @@ class VertigoZHoming:
         self.printer.register_event_handler(
             "homing:home_rails_end", self._handle_home_rails_end
         )
+        # Installed once everything is loaded so gcode_move has already claimed
+        # G0/G1 (we wrap them to block manual Z jogs while the bed is uncoupled).
+        self.printer.register_event_handler(
+            "klippy:connect", self._install_z_jog_guard
+        )
+        self._orig_move_cmd = None
 
         gcode = self.printer.lookup_object("gcode")
         gcode.register_command(
@@ -236,6 +242,28 @@ class VertigoZHoming:
                         "kinematics" % (stepper_name,)
                     )
                 bucket.append(stepper)
+
+    # ---- Block manual Z jogs while the bed is uncoupled ---------------- #
+    Z_JOG_BLOCKED_MSG = (
+        "The Z axis cannot be jogged manually in this state. "
+        "Home Z (G28 Z) before attempting to move the Z axis."
+    )
+
+    def _install_z_jog_guard(self):
+        # Wrap G0/G1 so a move with a Z word is refused while the bed is not
+        # coupled (e.g. after Z_HOME_FOR_SCRAPE, sitting on the endstops).
+        # gcode_move registers both G0 and G1 to the same handler; stash it and
+        # delegate to it for everything we allow.
+        gcode = self.printer.lookup_object("gcode")
+        self._orig_move_cmd = gcode.register_command("G1", None)
+        gcode.register_command("G0", None)
+        gcode.register_command("G1", self._cmd_guarded_move)
+        gcode.register_command("G0", self._cmd_guarded_move)
+
+    def _cmd_guarded_move(self, gcmd):
+        if not self.bed_coupled and "Z" in gcmd.get_command_parameters():
+            raise gcmd.error(self.Z_JOG_BLOCKED_MSG)
+        self._orig_move_cmd(gcmd)
 
     def get_status(self, eventtime):
         return {

@@ -67,6 +67,11 @@ DRIP_TIME = 0.100
 # to be larger than that rounding and far smaller than any real early trigger.
 FULL_MOVE_TOLERANCE = 0.1
 
+# Fallback step-generation flush horizon if the toolhead doesn't expose
+# kin_flush_delay (it normally does). See _move_start_time() for why this
+# margin is required.
+DEFAULT_KIN_FLUSH_DELAY = 0.250
+
 
 # ===========================================================================
 #  Minimal "toolhead + kinematics" that drives ONLY the rear Z steppers on a
@@ -122,6 +127,27 @@ class _RearZHomer:
         else:
             self.next_cmd_time = print_time
 
+    # The earliest time a new move appended to our private trapq may start.
+    #
+    # Our rear steppers stay registered as TOOLHEAD step generators even while
+    # detached onto this private trapq, so the toolhead's background flushing
+    # keeps advancing their step-generator clock. After a toolhead.dwell()
+    # (e.g. the inter-attempt delays) the dwell is queued ahead and, as it
+    # drains, the generators get advanced up to ~print_time + kin_flush_delay
+    # while our trapq is empty. A new move must therefore begin past that
+    # horizon; starting merely at print_time appends a move behind the
+    # generators' committed time, which makes stepcompress emit non-monotonic
+    # steps ("stepcompress ... Invalid sequence" -> Internal error).
+    #
+    # For back-to-back moves next_cmd_time already leads print_time, so the
+    # max() keeps the margin a no-op except right after a dwell -- exactly the
+    # case that needs it.
+    def _move_start_time(self, toolhead):
+        flush_margin = getattr(
+            toolhead, "kin_flush_delay", DEFAULT_KIN_FLUSH_DELAY
+        )
+        return max(self.next_cmd_time, toolhead.print_time + flush_margin)
+
     # plain (non-homing) isolated move, e.g. retract. Drives ONLY the rear
     # steppers (they are on our private trapq) but advances the real toolhead
     # clock + flushes its step generators via _advance_move_time, so the two
@@ -134,7 +160,7 @@ class _RearZHomer:
         axis_r, accel_t, cruise_t, cruise_v = force_move.calc_move_time(
             dist, speed, self.accel
         )
-        start = max(self.next_cmd_time, toolhead.print_time)
+        start = self._move_start_time(toolhead)
         self.trapq_append(
             self.trapq, start, accel_t, cruise_t, accel_t,
             cp, 0.0, 0.0, axis_r, 0.0, 0.0, 0.0, cruise_v, self.accel,
@@ -190,7 +216,7 @@ class _RearZHomer:
         axis_r, accel_t, cruise_t, cruise_v = force_move.calc_move_time(
             dist, speed, self.accel
         )
-        start = max(self.next_cmd_time, toolhead.print_time)
+        start = self._move_start_time(toolhead)
         end = start + accel_t + cruise_t + accel_t
         self.trapq_append(
             self.trapq, start, accel_t, cruise_t, accel_t,

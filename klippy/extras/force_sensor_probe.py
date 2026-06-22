@@ -23,12 +23,12 @@
 #   scrape_speed: 15.0           # mm/s, rear-pair travel speed (up & down)
 #   scrape_accel: 100            # mm/s^2 for the isolated rear-only moves
 #   scrape_threshold_z_pos: 390      # mm TOTAL travel; a trigger at/above this = fully scraped
-#   scrape_distance: 395             # mm full scrape travel; reaching it (trigger or not) = fully scraped (must be > threshold)
+#   scrape_distance: 400             # mm full scrape travel; reaching it (trigger or not) = fully scraped (must be > threshold)
 #   retries: 5                       # sub-threshold attempts allowed; REFILLS whenever an attempt digs deeper
 #   retry_tolerance: 1.0             # mm; a gain at/below this doesn't count as progress (won't refill retries)
 #   max_total_attempts: 20           # absolute safety cap on total attempts (runaway guard)
 #   delay_with_pressure: 1.0         # s to dwell while still loaded, BEFORE retracting
-#   delay_between_retries: 1.0       # s to dwell AFTER retract, before the next attempt
+#   delay_between_retries: 60.0      # s to dwell AFTER retract, before the next attempt
 #   retract_distance: 5.0            # mm to back off (descend) between retries
 #   rehome_gcode: G28 Z
 #   on_scraped_gcode:                # optional, runs after a successful scrape + home
@@ -166,6 +166,13 @@ class _RearZHomer:
             cp, 0.0, 0.0, axis_r, 0.0, 0.0, 0.0, cruise_v, self.accel,
         )
         end = start + accel_t + cruise_t + accel_t
+        # Newer toolhead API: report queued-move activity so step_gen_time /
+        # need_flush_time track our private-trapq steps. Without this the
+        # background flush handler desyncs our rear steppers' step generation
+        # (notably across a long dwell), corrupting the next move.
+        toolhead.note_mcu_movequeue_activity(
+            end + toolhead.kin_flush_delay, set_step_gen_time=True
+        )
         toolhead._advance_move_time(end)
         self.trapq_finalize_moves(self.trapq, end + 99999.9, end + 99999.9)
         self.commanded_pos = movepos
@@ -234,6 +241,12 @@ class _RearZHomer:
                 drip_completion.wait(curtime + wait_time)
                 continue
             pt = min(pt + DRIP_SEGMENT_TIME, end)
+            # Mirror toolhead._update_drip_move_time: report activity (advancing
+            # step_gen_time / need_flush_time) BEFORE advancing the move time, so
+            # the toolhead's flush bookkeeping matches the steps we just queued.
+            toolhead.note_mcu_movequeue_activity(
+                pt + toolhead.kin_flush_delay, set_step_gen_time=True
+            )
             toolhead._advance_move_time(pt)
         # Triggered or full move: free the (possibly un-traveled) remainder and
         # leave our clock at the real stop, not the far end of the move.

@@ -372,16 +372,11 @@ class ForceSensorProbe:
         # Mainsail/Fluidd interactive prompt + PAUSE. Requires [respond] and
         # [pause_resume] in printer.cfg.
         for line in [
-            'RESPOND TYPE=error MSG="Bed could not be fully scraped"',
-            'RESPOND TYPE=command MSG="action:prompt_begin Scrape failed"',
-            'RESPOND TYPE=command MSG="action:prompt_text The bed could not be'
-            ' fully scraped. Resume to continue or cancel the print."',
-            'RESPOND TYPE=command MSG="action:prompt_footer_button'
-            ' Resume|RESUME|primary"',
-            'RESPOND TYPE=command MSG="action:prompt_footer_button'
-            ' Cancel|CANCEL_PRINT|error"',
+            'RESPOND TYPE=command MSG="action:prompt_begin Stuck Part!"',
+            'RESPOND TYPE=command MSG="action:prompt_text Please clear the bed manually, then press Continue."',
+            'RESPOND TYPE=command MSG="action:prompt_footer_button Continue|_SCRAPE_FAIL_CONTINUE|primary"',
             'RESPOND TYPE=command MSG="action:prompt_show"',
-            "PAUSE",
+            'PAUSE_BASE'
         ]:
             gcode.run_script_from_command(line)
 

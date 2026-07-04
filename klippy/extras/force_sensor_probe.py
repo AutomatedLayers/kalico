@@ -229,30 +229,50 @@ class _RearZHomer:
             self.trapq, start, accel_t, cruise_t, accel_t,
             cp, 0.0, 0.0, axis_r, 0.0, 0.0, 0.0, cruise_v, self.accel,
         )
-        pt = start
-        while pt < end:
-            if drip_completion.test():
-                break
-            curtime = reactor.monotonic()
-            est = mcu.estimated_print_time(curtime)
-            wait_time = pt - est - flush_delay
-            if wait_time > 0.0:
-                # Don't run ahead of the MCU; wake early if the endstop fires.
-                drip_completion.wait(curtime + wait_time)
-                continue
-            pt = min(pt + DRIP_SEGMENT_TIME, end)
-            # Mirror toolhead._update_drip_move_time: report activity (advancing
-            # step_gen_time / need_flush_time) BEFORE advancing the move time, so
-            # the toolhead's flush bookkeeping matches the steps we just queued.
-            toolhead.note_mcu_movequeue_activity(
-                pt + toolhead.kin_flush_delay, set_step_gen_time=True
-            )
-            toolhead._advance_move_time(pt)
-        # Triggered or full move: free the (possibly un-traveled) remainder and
-        # leave our clock at the real stop, not the far end of the move.
-        self.trapq_finalize_moves(self.trapq, pt + 99999.9, pt + 99999.9)
-        self.commanded_pos = target
-        self.next_cmd_time = toolhead.print_time
+        # Suspend the toolhead's background flush handler and enter the "Drip"
+        # queuing state for the duration of this loop -- exactly as stock
+        # toolhead.drip_move does. Without this, the toolhead's _flush_handler
+        # timer keeps firing and generating steps for the rear pair CONCURRENTLY
+        # with our _advance_move_time calls below; the two generators can emit
+        # two steps at the same clock -> stepcompress "Invalid sequence" (seen on
+        # the 2nd probe after a trigger). note_mcu_movequeue_activity only synced
+        # the bookkeeping; this makes our loop the sole step-gen driver.
+        prev_state = toolhead.special_queuing_state
+        prev_kick = toolhead.do_kick_flush_timer
+        toolhead.special_queuing_state = "Drip"
+        toolhead.do_kick_flush_timer = False
+        reactor.update_timer(toolhead.flush_timer, reactor.NEVER)
+        try:
+            pt = start
+            while pt < end:
+                if drip_completion.test():
+                    break
+                curtime = reactor.monotonic()
+                est = mcu.estimated_print_time(curtime)
+                wait_time = pt - est - flush_delay
+                if wait_time > 0.0:
+                    # Don't run ahead of the MCU; wake early if endstop fires.
+                    drip_completion.wait(curtime + wait_time)
+                    continue
+                pt = min(pt + DRIP_SEGMENT_TIME, end)
+                # Mirror toolhead._update_drip_move_time: report activity
+                # (advancing step_gen_time / need_flush_time) BEFORE advancing
+                # the move time, so flush bookkeeping matches the queued steps.
+                toolhead.note_mcu_movequeue_activity(
+                    pt + toolhead.kin_flush_delay, set_step_gen_time=True
+                )
+                toolhead._advance_move_time(pt)
+            # Triggered or full move: free the (possibly un-traveled) remainder
+            # and leave our clock at the real stop, not the far end of the move.
+            self.trapq_finalize_moves(self.trapq, pt + 99999.9, pt + 99999.9)
+            self.commanded_pos = target
+            self.next_cmd_time = toolhead.print_time
+        finally:
+            # Restore normal flushing (mirrors stock drip_move's exit path).
+            toolhead.special_queuing_state = prev_state
+            toolhead.do_kick_flush_timer = prev_kick
+            reactor.update_timer(toolhead.flush_timer, reactor.NOW)
+            toolhead.flush_step_generation()
 
 
 class ForceSensorProbe:

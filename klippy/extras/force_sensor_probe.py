@@ -174,7 +174,7 @@ class _RearZHomer:
             end + toolhead.kin_flush_delay, set_step_gen_time=True
         )
         toolhead._advance_move_time(end)
-        self.trapq_finalize_moves(self.trapq, end + 99999.9, end + 99999.9)
+        self.trapq_finalize_moves(self.trapq, end + 99999.9, 0.0)
         self.commanded_pos = movepos
         self.next_cmd_time = toolhead.print_time
 
@@ -264,7 +264,7 @@ class _RearZHomer:
                 toolhead._advance_move_time(pt)
             # Triggered or full move: free the (possibly un-traveled) remainder
             # and leave our clock at the real stop, not the far end of the move.
-            self.trapq_finalize_moves(self.trapq, pt + 99999.9, pt + 99999.9)
+            self.trapq_finalize_moves(self.trapq, pt + 99999.9, 0.0)
             self.commanded_pos = target
             self.next_cmd_time = toolhead.print_time
         finally:

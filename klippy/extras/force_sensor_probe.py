@@ -8,7 +8,8 @@
 # and retries. After any outcome it re-homes Z.
 #
 # Written for the Kalico fork's (older, pre-motion_queuing) motion API:
-#   - chelper trapq alloc; step gen + clock driven via toolhead._advance_move_time
+#   - chelper trapq alloc; rear steppers pulled off toolhead.step_generators
+#     while attached and their steps generated here (like manual_stepper)
 #   - HomingMove built directly (Kalico manual_home() has no probe_pos arg)
 #   - per-stepper stepper_enable.lookup_enable().motor_enable/disable
 #   - clear_homing_state() takes axis INDICES ([2] for Z)
@@ -53,10 +54,11 @@ from klippy import chelper
 from . import force_move, homing
 
 
-# Drip pacing, mirroring toolhead.py: feed the probing move in small segments
-# so the host never queues far ahead of the MCU. Without this, a long move to
-# the limit gets queued in full and everything after the trigger waits for that
-# whole queue to drain.
+# Drip pacing: feed the probing move in short segments and generate our
+# own steps each segment, so we can stop the instant the sensor trips.
+# Queuing the whole move instead (manual_stepper style) would leave our
+# clock ~(untraveled distance / speed) in the future on an early trigger
+# and stall the next attempt for that long.
 DRIP_SEGMENT_TIME = 0.050
 DRIP_TIME = 0.100
 
@@ -66,11 +68,6 @@ DRIP_TIME = 0.100
 # target due to step-rounding -- a few microns in practice -- so this just has
 # to be larger than that rounding and far smaller than any real early trigger.
 FULL_MOVE_TOLERANCE = 0.1
-
-# Fallback step-generation flush horizon if the toolhead doesn't expose
-# kin_flush_delay (it normally does). See _move_start_time() for why this
-# margin is required.
-DEFAULT_KIN_FLUSH_DELAY = 0.250
 
 
 # ===========================================================================
@@ -88,6 +85,7 @@ class _RearZHomer:
         self.commanded_pos = 0.0
         self.next_cmd_time = 0.0
         self._saved = []  # [(stepper, prev_sk, prev_trapq, our_sk), ...]
+        self._saved_sg = []  # toolhead step-gen handlers pulled in attach()
         ffi_main, ffi_lib = chelper.get_ffi()
         self.ffi_main = ffi_main
         self.ffi_lib = ffi_lib
@@ -100,7 +98,19 @@ class _RearZHomer:
         toolhead = self.printer.lookup_object("toolhead")
         toolhead.flush_step_generation()
         self._saved = []
+        self._saved_sg = []
         for s in self.steppers:
+            # Take this stepper's step generator OFF the toolhead for the whole
+            # attach() window. While it is detached onto our private trapq, WE
+            # are its only step-gen driver (this mirrors manual_stepper, whose
+            # steppers are never on toolhead.step_generators). Leaving it
+            # registered is what let the toolhead's background flush handler and
+            # our own move-driving both advance it and emit two steps at the
+            # same clock -> "stepcompress ... Invalid sequence".
+            for h in list(toolhead.step_generators):
+                if getattr(h, "__self__", None) is s:
+                    toolhead.step_generators.remove(h)
+                    self._saved_sg.append(h)
             sk = self.ffi_main.gc(
                 self.ffi_lib.cartesian_stepper_alloc(b"x"), self.ffi_lib.free
             )
@@ -113,11 +123,25 @@ class _RearZHomer:
 
     # -- restore the rear steppers back onto the toolhead Z trapq --
     def detach(self):
-        self.sync_print_time()
-        for s, prev_sk, prev_trapq, _sk in self._saved:
-            s.set_trapq(prev_trapq)
-            s.set_stepper_kinematics(prev_sk)
-        self._saved = []
+        toolhead = self.printer.lookup_object("toolhead")
+        try:
+            self.sync_print_time()
+            # Push every step we generated on the private trapq out to the MCU
+            # before handing these steppers back. The rear steppers are still
+            # off step_generators here, so this only flushes the MCU queue; it
+            # does not (re)generate their steps.
+            toolhead.flush_step_generation()
+        finally:
+            # Always restore, even if the flush above raised -- otherwise the
+            # rear steppers would be left off the toolhead and normal Z motion
+            # (and the G28 Z re-home) could not drive them.
+            for s, prev_sk, prev_trapq, _sk in self._saved:
+                s.set_trapq(prev_trapq)
+                s.set_stepper_kinematics(prev_sk)
+            for h in self._saved_sg:
+                toolhead.register_step_generator(h)
+            self._saved = []
+            self._saved_sg = []
 
     def sync_print_time(self):
         toolhead = self.printer.lookup_object("toolhead")
@@ -127,31 +151,10 @@ class _RearZHomer:
         else:
             self.next_cmd_time = print_time
 
-    # The earliest time a new move appended to our private trapq may start.
-    #
-    # Our rear steppers stay registered as TOOLHEAD step generators even while
-    # detached onto this private trapq, so the toolhead's background flushing
-    # keeps advancing their step-generator clock. After a toolhead.dwell()
-    # (e.g. the inter-attempt delays) the dwell is queued ahead and, as it
-    # drains, the generators get advanced up to ~print_time + kin_flush_delay
-    # while our trapq is empty. A new move must therefore begin past that
-    # horizon; starting merely at print_time appends a move behind the
-    # generators' committed time, which makes stepcompress emit non-monotonic
-    # steps ("stepcompress ... Invalid sequence" -> Internal error).
-    #
-    # For back-to-back moves next_cmd_time already leads print_time, so the
-    # max() keeps the margin a no-op except right after a dwell -- exactly the
-    # case that needs it.
-    def _move_start_time(self, toolhead):
-        flush_margin = getattr(
-            toolhead, "kin_flush_delay", DEFAULT_KIN_FLUSH_DELAY
-        )
-        return max(self.next_cmd_time, toolhead.print_time + flush_margin)
-
-    # plain (non-homing) isolated move, e.g. retract. Drives ONLY the rear
-    # steppers (they are on our private trapq) but advances the real toolhead
-    # clock + flushes its step generators via _advance_move_time, so the two
-    # clocks stay aligned and nothing schedules far in the future.
+    # plain (non-homing) isolated move, e.g. the inter-attempt retract. Drives
+    # ONLY the rear steppers (they are alone on our private trapq) and WE
+    # generate their steps here -- the toolhead never touches them while
+    # attached. Mirrors manual_stepper.do_move.
     def move(self, movepos, speed):
         toolhead = self.printer.lookup_object("toolhead")
         self.sync_print_time()
@@ -160,23 +163,25 @@ class _RearZHomer:
         axis_r, accel_t, cruise_t, cruise_v = force_move.calc_move_time(
             dist, speed, self.accel
         )
-        start = self._move_start_time(toolhead)
         self.trapq_append(
-            self.trapq, start, accel_t, cruise_t, accel_t,
+            self.trapq, self.next_cmd_time, accel_t, cruise_t, accel_t,
             cp, 0.0, 0.0, axis_r, 0.0, 0.0, 0.0, cruise_v, self.accel,
         )
-        end = start + accel_t + cruise_t + accel_t
-        # Newer toolhead API: report queued-move activity so step_gen_time /
-        # need_flush_time track our private-trapq steps. Without this the
-        # background flush handler desyncs our rear steppers' step generation
-        # (notably across a long dwell), corrupting the next move.
-        toolhead.note_mcu_movequeue_activity(
-            end + toolhead.kin_flush_delay, set_step_gen_time=True
+        self.next_cmd_time += accel_t + cruise_t + accel_t
+        for s in self.steppers:
+            s.generate_steps(self.next_cmd_time)
+        self.trapq_finalize_moves(
+            self.trapq,
+            self.next_cmd_time + 99999.9,
+            self.next_cmd_time + 99999.9,
         )
-        toolhead._advance_move_time(end)
-        self.trapq_finalize_moves(self.trapq, end + 99999.9, 0.0)
+        # Bump only the MCU flush horizon (need_flush_time). Do NOT set
+        # step_gen_time: these steppers are off the toolhead's generators, so
+        # their steps are already generated above; the background flush just
+        # needs to push them to the MCU.
+        toolhead.note_mcu_movequeue_activity(self.next_cmd_time)
         self.commanded_pos = movepos
-        self.next_cmd_time = toolhead.print_time
+        self.sync_print_time()
 
     # ---- toolhead/kinematics interface used by HomingMove ----
     def flush_step_generation(self):
@@ -208,11 +213,13 @@ class _RearZHomer:
         self.next_cmd_time += max(0.0, delay)
 
     def drip_move(self, newpos, speed, drip_completion):
-        # Paced, truncating drip (mirrors toolhead._update_drip_move_time).
-        # Feed the move to the limit in 50ms segments; stop the instant the
-        # endstop fires. _advance_move_time advances the real toolhead clock
-        # AND flushes step generators -- z2/z3 read our private trapq, so only
-        # they move; z/z1 read the (empty) toolhead trapq and stay put.
+        # Paced, truncating drip. Feed the move in small segments and advance
+        # the toolhead clock only as far as the motion actually gets, stopping
+        # the instant the force sensor fires. Rear steppers are off
+        # toolhead.step_generators for the whole attach() window, so WE generate
+        # their steps here and nothing else can -- no race, no flush-state
+        # juggling. _advance_move_time then advances print_time incrementally
+        # and flushes the freshly generated steps out to the MCU.
         toolhead = self.printer.lookup_object("toolhead")
         reactor = self.printer.get_reactor()
         mcu = toolhead.mcu
@@ -223,57 +230,31 @@ class _RearZHomer:
         axis_r, accel_t, cruise_t, cruise_v = force_move.calc_move_time(
             dist, speed, self.accel
         )
-        start = self._move_start_time(toolhead)
+        self.sync_print_time()
+        start = self.next_cmd_time
         end = start + accel_t + cruise_t + accel_t
         self.trapq_append(
             self.trapq, start, accel_t, cruise_t, accel_t,
             cp, 0.0, 0.0, axis_r, 0.0, 0.0, 0.0, cruise_v, self.accel,
         )
-        # Suspend the toolhead's background flush handler and enter the "Drip"
-        # queuing state for the duration of this loop -- exactly as stock
-        # toolhead.drip_move does. Without this, the toolhead's _flush_handler
-        # timer keeps firing and generating steps for the rear pair CONCURRENTLY
-        # with our _advance_move_time calls below; the two generators can emit
-        # two steps at the same clock -> stepcompress "Invalid sequence" (seen on
-        # the 2nd probe after a trigger). note_mcu_movequeue_activity only synced
-        # the bookkeeping; this makes our loop the sole step-gen driver.
-        prev_state = toolhead.special_queuing_state
-        prev_kick = toolhead.do_kick_flush_timer
-        toolhead.special_queuing_state = "Drip"
-        toolhead.do_kick_flush_timer = False
-        reactor.update_timer(toolhead.flush_timer, reactor.NEVER)
-        try:
-            pt = start
-            while pt < end:
-                if drip_completion.test():
-                    break
-                curtime = reactor.monotonic()
-                est = mcu.estimated_print_time(curtime)
-                wait_time = pt - est - flush_delay
-                if wait_time > 0.0:
-                    # Don't run ahead of the MCU; wake early if endstop fires.
-                    drip_completion.wait(curtime + wait_time)
-                    continue
-                pt = min(pt + DRIP_SEGMENT_TIME, end)
-                # Mirror toolhead._update_drip_move_time: report activity
-                # (advancing step_gen_time / need_flush_time) BEFORE advancing
-                # the move time, so flush bookkeeping matches the queued steps.
-                toolhead.note_mcu_movequeue_activity(
-                    pt + toolhead.kin_flush_delay, set_step_gen_time=True
-                )
-                toolhead._advance_move_time(pt)
-            # Triggered or full move: free the (possibly un-traveled) remainder
-            # and leave our clock at the real stop, not the far end of the move.
-            self.trapq_finalize_moves(self.trapq, pt + 99999.9, 0.0)
-            self.commanded_pos = target
-            self.next_cmd_time = toolhead.print_time
-        finally:
-            # Restore normal flushing (mirrors stock drip_move's exit path).
-            toolhead.special_queuing_state = prev_state
-            toolhead.do_kick_flush_timer = prev_kick
-            reactor.update_timer(toolhead.flush_timer, reactor.NOW)
-            toolhead.flush_step_generation()
-
+        pt = start
+        while pt < end:
+            if drip_completion.test():
+                break
+            curtime = reactor.monotonic()
+            est = mcu.estimated_print_time(curtime)
+            wait_time = pt - est - flush_delay
+            if wait_time > 0.0:
+                drip_completion.wait(curtime + wait_time)
+                continue
+            pt = min(pt + DRIP_SEGMENT_TIME, end)
+            for s in self.steppers:
+                s.generate_steps(pt)
+            toolhead.note_mcu_movequeue_activity(pt + toolhead.kin_flush_delay)
+            toolhead._advance_move_time(pt)
+        self.trapq_finalize_moves(self.trapq, pt + 99999.9, pt + 99999.9)
+        self.commanded_pos = target
+        self.next_cmd_time = toolhead.print_time
 
 class ForceSensorProbe:
     def __init__(self, config):
